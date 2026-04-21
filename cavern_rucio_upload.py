@@ -337,15 +337,20 @@ def attach_to_dataset(
 # Input expansion
 # ---------------------------------------------------------------------------
 
-def expand_inputs(paths: list[Path]) -> list[tuple[Path, str]]:
+def expand_inputs(paths: list[Path], include_top_dir: bool = True) -> list[tuple[Path, str]]:
     """
     Expand a mixed list of files and directories into (local_path, logical_name) pairs.
 
     - File: logical_name is the bare filename.
-    - Directory: recurses and sets logical_name to the path relative to that
-      directory, preserving subdirectory structure as part of the DID name.
-      e.g. input dir /data/obs/, file /data/obs/2024/jan/file.fits
-           → logical_name = "2024/jan/file.fits"
+    - Directory: recurses and builds logical_name from the path relative to the
+      directory's *parent*, so the directory name itself is included by default.
+
+      include_top_dir=True  (default):
+        input /data/obs/, file /data/obs/2024/jan/file.fits
+        → logical_name = "obs/2024/jan/file.fits"
+
+      include_top_dir=False:
+        → logical_name = "2024/jan/file.fits"
     """
     result = []
     for path in paths:
@@ -356,8 +361,9 @@ def expand_inputs(paths: list[Path]) -> list[tuple[Path, str]]:
             if not files:
                 log.warning("Directory is empty, skipping: %s", path)
                 continue
+            base = path.parent if include_top_dir else path
             for file in files:
-                result.append((file, str(file.relative_to(path))))
+                result.append((file, str(file.relative_to(base))))
         else:
             log.error("Path does not exist or is not a file/directory: %s", path)
     return result
@@ -419,6 +425,9 @@ def parse_args() -> argparse.Namespace:
                    help="Override the Rucio logical filename (single-file uploads only)")
     p.add_argument("--dataset", metavar="SCOPE:NAME",
                    help="Attach successful uploads to this dataset; created if it does not exist")
+    p.add_argument("--no-top-dir", action="store_true",
+                   help="Exclude the top-level directory name from the Rucio logical name "
+                        "when uploading a directory. By default the directory name is included.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print planned actions without transferring or registering anything")
     p.add_argument("--verbose", "-v", action="store_true",
@@ -482,7 +491,7 @@ def main() -> None:
             sys.exit(1)
 
     # Expand files/directories into (path, logical_name) pairs
-    inputs = expand_inputs(args.files)
+    inputs = expand_inputs(args.files, include_top_dir=not args.no_top_dir)
     if args.name:
         # --name is only valid for a single file; guard above ensures this
         inputs = [(inputs[0][0], args.name)]
