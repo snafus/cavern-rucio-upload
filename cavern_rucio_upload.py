@@ -438,7 +438,11 @@ def add_rule(
 # Input expansion
 # ---------------------------------------------------------------------------
 
-def expand_inputs(paths: list[Path], include_top_dir: bool = True) -> list[tuple[Path, str]]:
+def expand_inputs(
+    paths: list[Path],
+    include_top_dir: bool = True,
+    patterns: list[str] | None = None,
+) -> list[tuple[Path, str]]:
     """
     Expand a mixed list of files and directories into (local_path, logical_name) pairs.
 
@@ -452,10 +456,16 @@ def expand_inputs(paths: list[Path], include_top_dir: bool = True) -> list[tuple
 
       include_top_dir=False:
         → logical_name = "2024/jan/file.fits"
+
+    patterns are matched against the path relative to the input directory
+    (i.e. "2024/jan/file.fits" regardless of include_top_dir), so pattern
+    behaviour is stable and independent of DID naming options.
     """
     result = []
     for path in paths:
         if path.is_file():
+            if patterns and not any(fnmatch.fnmatch(path.name, p) for p in patterns):
+                continue
             result.append((path, path.name))
         elif path.is_dir():
             files = sorted(f for f in path.rglob("*") if f.is_file())
@@ -464,35 +474,13 @@ def expand_inputs(paths: list[Path], include_top_dir: bool = True) -> list[tuple
                 continue
             base = path.parent if include_top_dir else path
             for file in files:
+                rel = str(file.relative_to(path))   # always relative to input dir for matching
+                if patterns and not any(fnmatch.fnmatch(rel, p) for p in patterns):
+                    continue
                 result.append((file, str(file.relative_to(base))))
         else:
             log.error("Path does not exist or is not a file/directory: %s", path)
     return result
-
-
-def filter_inputs(
-    inputs: list[tuple[Path, str]],
-    patterns: list[str],
-) -> list[tuple[Path, str]]:
-    """
-    Filter (path, logical_name) pairs against one or more glob patterns.
-
-    Patterns are matched against the logical name (relative path used as the
-    DID name), so they naturally address subdirectory structure:
-      *.fits          — any .fits file at any depth
-      2024/**         — everything under a 2024/ prefix
-      **/cal_*.fits   — cal_-prefixed fits files in any subdirectory
-
-    A file is kept if it matches ANY of the supplied patterns (OR logic).
-    If no patterns are given all files are kept.
-    """
-    if not patterns:
-        return inputs
-    kept = [(p, n) for p, n in inputs if any(fnmatch.fnmatch(n, pat) for pat in patterns)]
-    dropped = len(inputs) - len(kept)
-    if dropped:
-        log.debug("Pattern filter dropped %d file(s), keeping %d", dropped, len(kept))
-    return kept
 
 
 def print_dry_run_summary(
@@ -668,7 +656,11 @@ def main() -> None:
             sys.exit(1)
 
     # Expand files/directories into (path, logical_name) pairs
-    inputs = expand_inputs(args.files, include_top_dir=not args.no_top_dir)
+    inputs = expand_inputs(
+        args.files,
+        include_top_dir=not args.no_top_dir,
+        patterns=args.include or None,
+    )
     if args.name:
         # --name is only valid for a single file; guard above ensures this
         inputs = [(inputs[0][0], args.name)]
@@ -676,9 +668,6 @@ def main() -> None:
     if args.name_prefix:
         prefix = args.name_prefix.rstrip("/") + "/"
         inputs = [(p, prefix + n) for p, n in inputs]
-
-    if args.include:
-        inputs = filter_inputs(inputs, args.include)
 
     if not inputs:
         log.error("No files found to upload (check --include patterns)")
