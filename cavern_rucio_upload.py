@@ -218,10 +218,12 @@ def put_file(
         return True
 
     size = local_path.stat().st_size
+    # requests has no adapter for davs://; it is plain HTTPS under the hood
+    put_url = pfn.replace("davs://", "https://", 1)
     try:
         with open(local_path, "rb") as fh:
             resp = requests.put(
-                pfn,
+                put_url,
                 data=fh,
                 headers={
                     "Authorization": f"Bearer {token}",
