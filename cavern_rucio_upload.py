@@ -177,17 +177,40 @@ def get_webdav_protocol(rse_name: str, rse_client: RSEClient) -> dict:
     )
 
 
+_PFN_BATCH_SIZE = 500
+
+
+def _resolve_pfns_batch(
+    scope: str,
+    names: list[str],
+    scheme: str,
+    hostname: str,
+    port: int,
+    prefix: str,
+) -> dict[str, str]:
+    result = {}
+    for name in names:
+        digest = hashlib.md5(f"{scope}:{name}".encode()).hexdigest()
+        path = f"{prefix}/{scope}/{digest[0:2]}/{digest[2:4]}/{name}"
+        result[f"{scope}:{name}"] = f"{scheme}://{hostname}:{port}{path}"
+    return result
+
+
 def resolve_pfns(
     rse_name: str,
     scope: str,
     names: list[str],
     protocol: dict,
+    batch_size: int = _PFN_BATCH_SIZE,
 ) -> dict[str, str]:
     """
-    Construct deterministic PFNs for a list of logical filenames.
+    Construct deterministic PFNs for a list of logical filenames, in batches.
 
     Uses Rucio's standard deterministic path algorithm:
       MD5(scope:name) → prefix/scope/xx/yy/name
+
+    Processed in chunks of batch_size to avoid excessive memory use or
+    oversized requests if the implementation is later switched to an HTTP call.
 
     RSEClient.lfns2pfns() exists for this purpose but iterates over dict keys
     rather than values in some client versions, producing malformed query strings.
@@ -200,10 +223,10 @@ def resolve_pfns(
     prefix = protocol["prefix"].rstrip("/")
 
     result = {}
-    for name in names:
-        digest = hashlib.md5(f"{scope}:{name}".encode()).hexdigest()
-        path = f"{prefix}/{scope}/{digest[0:2]}/{digest[2:4]}/{name}"
-        result[f"{scope}:{name}"] = f"{scheme}://{hostname}:{port}{path}"
+    for i in range(0, len(names), batch_size):
+        chunk = names[i:i + batch_size]
+        log.debug("Resolving PFNs for names %d–%d of %d", i + 1, i + len(chunk), len(names))
+        result.update(_resolve_pfns_batch(scope, chunk, scheme, hostname, port, prefix))
     return result
 
 
