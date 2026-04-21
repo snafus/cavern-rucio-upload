@@ -20,6 +20,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import logging
 import os
@@ -469,6 +470,52 @@ def expand_inputs(paths: list[Path], include_top_dir: bool = True) -> list[tuple
     return result
 
 
+def filter_inputs(
+    inputs: list[tuple[Path, str]],
+    patterns: list[str],
+) -> list[tuple[Path, str]]:
+    """
+    Filter (path, logical_name) pairs against one or more glob patterns.
+
+    Patterns are matched against the logical name (relative path used as the
+    DID name), so they naturally address subdirectory structure:
+      *.fits          — any .fits file at any depth
+      2024/**         — everything under a 2024/ prefix
+      **/cal_*.fits   — cal_-prefixed fits files in any subdirectory
+
+    A file is kept if it matches ANY of the supplied patterns (OR logic).
+    If no patterns are given all files are kept.
+    """
+    if not patterns:
+        return inputs
+    kept = [(p, n) for p, n in inputs if any(fnmatch.fnmatch(n, pat) for pat in patterns)]
+    dropped = len(inputs) - len(kept)
+    if dropped:
+        log.debug("Pattern filter dropped %d file(s), keeping %d", dropped, len(kept))
+    return kept
+
+
+def print_dry_run_summary(
+    inputs: list[tuple[Path, str]],
+    scope: str,
+    pfn_map: dict[str, str],
+) -> None:
+    """Print a formatted table of files that would be uploaded."""
+    col1 = max((len(str(p)) for p, _ in inputs), default=10)
+    col2 = max((len(f"{scope}:{n}") for _, n in inputs), default=10)
+    col1 = max(col1, len("Local path"))
+    col2 = max(col2, len("DID (scope:name)"))
+
+    header = f"  {'Local path':<{col1}}  {'DID (scope:name)':<{col2}}  PFN"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for path, name in inputs:
+        did = f"{scope}:{name}"
+        pfn = pfn_map.get(did, "(unresolved)")
+        print(f"  {str(path):<{col1}}  {did:<{col2}}  {pfn}")
+    print(f"\n  {len(inputs)} file(s) — dry run, nothing transferred.\n")
+
+
 # ---------------------------------------------------------------------------
 # Per-file orchestrator
 # ---------------------------------------------------------------------------
@@ -493,8 +540,6 @@ def upload_and_register(
     log.debug("  pfn=%s", pfn)
 
     if dry_run:
-        log.info("[dry-run] would PUT %s → %s", local_path, pfn)
-        log.info("[dry-run] would register replica %s:%s on %s", scope, name, rse_name)
         return True
 
     meta = compute_metadata(local_path)
@@ -532,6 +577,11 @@ def parse_args() -> argparse.Namespace:
                         "(e.g. 'newdata/' → 'newdata/obs/file.fits')")
     p.add_argument("--dataset", metavar="SCOPE:NAME",
                    help="Attach successful uploads to this dataset; created if it does not exist")
+    p.add_argument("--include", metavar="PATTERN", action="append", dest="include",
+                   help="Only upload files whose logical name matches this glob pattern. "
+                        "May be given multiple times (OR logic). Patterns are matched against "
+                        "the full logical name including any subdirectory path, e.g. "
+                        "'*.fits', '2024/**', '**/cal_*.ms'.")
     p.add_argument("--no-top-dir", action="store_true",
                    help="Exclude the top-level directory name from the Rucio logical name "
                         "when uploading a directory. By default the directory name is included.")
@@ -627,8 +677,11 @@ def main() -> None:
         prefix = args.name_prefix.rstrip("/") + "/"
         inputs = [(p, prefix + n) for p, n in inputs]
 
+    if args.include:
+        inputs = filter_inputs(inputs, args.include)
+
     if not inputs:
-        log.error("No files found to upload")
+        log.error("No files found to upload (check --include patterns)")
         sys.exit(1)
 
     log.info("Found %d file(s) to upload", len(inputs))
@@ -638,8 +691,11 @@ def main() -> None:
     try:
         pfn_map = resolve_pfns(args.rse, args.scope, names, protocol)
     except Exception as exc:
-        log.error("Failed to resolve PFNs from Rucio: %s", exc)
+        log.error("Failed to resolve PFNs: %s", exc)
         sys.exit(1)
+
+    if args.dry_run:
+        print_dry_run_summary(inputs, args.scope, pfn_map)
 
     # Upload loop
     succeeded: list[dict] = []
