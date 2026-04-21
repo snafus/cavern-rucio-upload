@@ -334,6 +334,36 @@ def attach_to_dataset(
 
 
 # ---------------------------------------------------------------------------
+# Input expansion
+# ---------------------------------------------------------------------------
+
+def expand_inputs(paths: list[Path]) -> list[tuple[Path, str]]:
+    """
+    Expand a mixed list of files and directories into (local_path, logical_name) pairs.
+
+    - File: logical_name is the bare filename.
+    - Directory: recurses and sets logical_name to the path relative to that
+      directory, preserving subdirectory structure as part of the DID name.
+      e.g. input dir /data/obs/, file /data/obs/2024/jan/file.fits
+           → logical_name = "2024/jan/file.fits"
+    """
+    result = []
+    for path in paths:
+        if path.is_file():
+            result.append((path, path.name))
+        elif path.is_dir():
+            files = sorted(f for f in path.rglob("*") if f.is_file())
+            if not files:
+                log.warning("Directory is empty, skipping: %s", path)
+                continue
+            for file in files:
+                result.append((file, str(file.relative_to(path))))
+        else:
+            log.error("Path does not exist or is not a file/directory: %s", path)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Per-file orchestrator
 # ---------------------------------------------------------------------------
 
@@ -377,8 +407,10 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    p.add_argument("files", nargs="+", type=Path, metavar="FILE",
-                   help="Source file(s) to upload")
+    p.add_argument("files", nargs="+", type=Path, metavar="PATH",
+                   help="Source file(s) or directory/ies to upload. "
+                        "Directories are walked recursively; subdirectory structure "
+                        "is preserved as part of the Rucio logical name.")
     p.add_argument("--scope", required=True,
                    help="Rucio scope applied to all files")
     p.add_argument("--rse", required=True,
@@ -413,8 +445,8 @@ def main() -> None:
         format="%(levelname)s %(message)s",
     )
 
-    if args.name and len(args.files) > 1:
-        log.error("--name can only be used with a single input file")
+    if args.name and (len(args.files) > 1 or args.files[0].is_dir()):
+        log.error("--name can only be used with a single input file, not a directory or multiple paths")
         sys.exit(1)
 
     # Rucio clients — share one auth context
@@ -449,18 +481,23 @@ def main() -> None:
             log.error("Failed to ensure dataset %s: %s", args.dataset, exc)
             sys.exit(1)
 
+    # Expand files/directories into (path, logical_name) pairs
+    inputs = expand_inputs(args.files)
+    if args.name:
+        # --name is only valid for a single file; guard above ensures this
+        inputs = [(inputs[0][0], args.name)]
+
+    if not inputs:
+        log.error("No files found to upload")
+        sys.exit(1)
+
+    log.info("Found %d file(s) to upload", len(inputs))
+
     # Upload loop
     succeeded: list[dict] = []
     failed: list[Path] = []
 
-    for path in args.files:
-        if not path.is_file():
-            log.error("Not a file (skipping): %s", path)
-            failed.append(path)
-            continue
-
-        logical_name = args.name if args.name else path.name
-
+    for path, logical_name in inputs:
         ok = upload_and_register(
             local_path=path,
             scope=args.scope,
@@ -475,7 +512,7 @@ def main() -> None:
         if ok:
             succeeded.append({"scope": args.scope, "name": logical_name})
         else:
-            failed.append(path)
+            failed.append(path)  # type: ignore[arg-type]
 
     # Attach successful uploads to dataset
     if dataset_scope and succeeded:
