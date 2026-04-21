@@ -20,6 +20,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import sys
@@ -180,17 +181,30 @@ def resolve_pfns(
     rse_name: str,
     scope: str,
     names: list[str],
-    rse_client: RSEClient,
+    protocol: dict,
 ) -> dict[str, str]:
     """
-    Resolve logical filenames to PFNs using Rucio's own lfns2pfns API.
+    Construct deterministic PFNs for a list of logical filenames.
 
-    Returns a dict mapping 'scope:name' → PFN for each name in names.
-    Uses the RSE's configured lfn2pfn_algorithm, so custom path schemes
-    are handled correctly without any hand-rolled path construction.
+    Uses Rucio's standard deterministic path algorithm:
+      MD5(scope:name) → prefix/scope/xx/yy/name
+
+    RSEClient.lfns2pfns() exists for this purpose but iterates over dict keys
+    rather than values in some client versions, producing malformed query strings.
+    The deterministic algorithm is stable and well-defined; since get_webdav_protocol()
+    already verifies the RSE is deterministic, this is safe to apply directly.
     """
-    lfns = [{"scope": scope, "name": name} for name in names]
-    return rse_client.lfns2pfns(rse=rse_name, lfns=lfns, operation="write")
+    scheme = protocol["scheme"]
+    hostname = protocol["hostname"]
+    port = protocol.get("port", 443)
+    prefix = protocol["prefix"].rstrip("/")
+
+    result = {}
+    for name in names:
+        digest = hashlib.md5(f"{scope}:{name}".encode()).hexdigest()
+        path = f"{prefix}/{scope}/{digest[0:2]}/{digest[2:4]}/{name}"
+        result[f"{scope}:{name}"] = f"{scheme}://{hostname}:{port}{path}"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -557,9 +571,12 @@ def main() -> None:
     # Storage endpoint token provider
     token_provider = build_token_provider(args, rucio_client)
 
-    # Verify the RSE has a write-capable WebDAV protocol (needed for davs→https rewrite on PUT)
+    # Resolve RSE WebDAV protocol — needed for PFN construction and davs→https rewrite on PUT
     try:
-        get_webdav_protocol(args.rse, rse_client)
+        protocol = get_webdav_protocol(args.rse, rse_client)
+        log.debug("Using protocol: %s://%s:%s%s",
+                  protocol["scheme"], protocol["hostname"],
+                  protocol.get("port", 443), protocol["prefix"])
     except ValueError as exc:
         log.error("%s", exc)
         sys.exit(1)
@@ -596,7 +613,7 @@ def main() -> None:
     # Resolve all PFNs in one batch call before transferring anything
     names = [name for _, name in inputs]
     try:
-        pfn_map = resolve_pfns(args.rse, args.scope, names, rse_client)
+        pfn_map = resolve_pfns(args.rse, args.scope, names, protocol)
     except Exception as exc:
         log.error("Failed to resolve PFNs from Rucio: %s", exc)
         sys.exit(1)
