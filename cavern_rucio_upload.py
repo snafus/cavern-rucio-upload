@@ -34,7 +34,8 @@ from rucio.client.client import Client
 from rucio.client.didclient import DIDClient
 from rucio.client.replicaclient import ReplicaClient
 from rucio.client.rseclient import RSEClient
-from rucio.common.exception import DataIdentifierAlreadyExists
+from rucio.client.ruleclient import RuleClient
+from rucio.common.exception import DataIdentifierAlreadyExists, DuplicateRule
 
 log = logging.getLogger(__name__)
 
@@ -334,6 +335,70 @@ def attach_to_dataset(
 
 
 # ---------------------------------------------------------------------------
+# Replication rules
+# ---------------------------------------------------------------------------
+
+_SECONDS_PER_DAY = 86_400
+
+
+def add_rule(
+    scope: str,
+    name: str,
+    rse_expression: str,
+    rule_client: RuleClient,
+    copies: int = 1,
+    lifetime_days: float | None = None,
+    dry_run: bool = False,
+    **kwargs,
+) -> str | None:
+    """
+    Add a replication rule on DID scope:name targeting rse_expression.
+
+    lifetime_days is converted to whole seconds (1 day = 86 400 s).
+    Returns the rule ID on success, None on failure.
+
+    A DuplicateRule is treated as a non-fatal warning — Rucio already has
+    an equivalent rule in place, so the data is protected.
+    """
+    lifetime_seconds: int | None = None
+    if lifetime_days is not None:
+        lifetime_seconds = int(lifetime_days * _SECONDS_PER_DAY)
+
+    if dry_run:
+        lifetime_str = f"{lifetime_seconds}s ({lifetime_days}d)" if lifetime_seconds else "permanent"
+        log.info(
+            "[dry-run] add rule: %s:%s → %s  copies=%d  lifetime=%s",
+            scope, name, rse_expression, copies, lifetime_str,
+        )
+        return None
+
+    try:
+        rule_ids = rule_client.add_replication_rule(
+            dids=[{"scope": scope, "name": name}],
+            copies=copies,
+            rse_expression=rse_expression,
+            lifetime=lifetime_seconds,
+            **kwargs,
+        )
+        rule_id = rule_ids[0]
+        log.info(
+            "Added rule %s: %s:%s → %s  copies=%d  lifetime=%s",
+            rule_id, scope, name, rse_expression, copies,
+            f"{lifetime_seconds}s ({lifetime_days}d)" if lifetime_seconds else "permanent",
+        )
+        return rule_id
+    except DuplicateRule:
+        log.warning(
+            "Rule already exists for %s:%s → %s (skipping)",
+            scope, name, rse_expression,
+        )
+        return None
+    except Exception as exc:
+        log.error("Failed to add rule for %s:%s → %s: %s", scope, name, rse_expression, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Input expansion
 # ---------------------------------------------------------------------------
 
@@ -433,6 +498,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Enable debug logging")
 
+    rule = p.add_argument_group("replication rule")
+    rule.add_argument("--add-rule", action="store_true",
+                      help="Add a Rucio replication rule on the dataset DID after upload. "
+                           "Requires --dataset.")
+    rule.add_argument("--rule-rse-expression", metavar="EXPR",
+                      help="RSE expression for the rule (default: the upload RSE). "
+                           "Set to a different RSE to trigger an automatic transfer there; "
+                           "Rucio will lock the source replica until the transfer completes.")
+    rule.add_argument("--rule-copies", type=int, default=1, metavar="N",
+                      help="Number of copies the rule should enforce (default: 1)")
+    rule.add_argument("--rule-lifetime", type=float, default=None, metavar="DAYS",
+                      help="Rule lifetime in days. Omit for a permanent rule. "
+                           "Fractional days are accepted (e.g. 0.5 = 12 hours). "
+                           "Converted to seconds internally (1 day = 86 400 s).")
+
     tok = p.add_mutually_exclusive_group()
     tok.add_argument("--storage-token-env", metavar="VAR",
                      help="Read storage bearer token from this environment variable")
@@ -458,11 +538,16 @@ def main() -> None:
         log.error("--name can only be used with a single input file, not a directory or multiple paths")
         sys.exit(1)
 
+    if args.add_rule and not args.dataset:
+        log.error("--add-rule requires --dataset")
+        sys.exit(1)
+
     # Rucio clients — share one auth context
     rucio_client = Client()
     rse_client = RSEClient()
     replica_client = ReplicaClient()
     did_client = DIDClient()
+    rule_client = RuleClient()
 
     # Storage endpoint token provider
     token_provider = build_token_provider(args, rucio_client)
@@ -532,6 +617,19 @@ def main() -> None:
                 "Failed to attach DIDs to dataset %s:%s — %s",
                 dataset_scope, dataset_name, exc,
             )
+
+    # Add replication rule on the dataset DID
+    if args.add_rule and dataset_scope and succeeded:
+        rse_expr = args.rule_rse_expression or args.rse
+        add_rule(
+            scope=dataset_scope,
+            name=dataset_name,
+            rse_expression=rse_expr,
+            rule_client=rule_client,
+            copies=args.rule_copies,
+            lifetime_days=args.rule_lifetime,
+            dry_run=args.dry_run,
+        )
 
     log.info("Done: %d succeeded, %d failed", len(succeeded), len(failed))
     if failed:
