@@ -455,11 +455,16 @@ def upload_and_register(
     """
     log.info("Processing %s → %s:%s", local_path, scope, name)
 
-    meta = compute_metadata(local_path)
     pfn = build_pfn(scope, name, protocol)
-
-    log.debug("  size=%s  adler32=%s", meta["size"], meta["adler32"])
     log.debug("  pfn=%s", pfn)
+
+    if dry_run:
+        log.info("[dry-run] would PUT %s → %s", local_path, pfn)
+        log.info("[dry-run] would register replica %s:%s on %s", scope, name, rse_name)
+        return True
+
+    meta = compute_metadata(local_path)
+    log.debug("  size=%s  adler32=%s", meta["size"], meta["adler32"])
 
     token = token_provider.get_token()
     if not put_file(local_path, pfn, token, dry_run):
