@@ -493,6 +493,9 @@ def parse_args() -> argparse.Namespace:
                    help="Destination RSE name")
     p.add_argument("--name", metavar="LOGICAL_NAME",
                    help="Override the Rucio logical filename (single-file uploads only)")
+    p.add_argument("--name-prefix", metavar="PREFIX",
+                   help="Prepend a fixed string to every logical DID name "
+                        "(e.g. 'newdata/' → 'newdata/obs/file.fits')")
     p.add_argument("--dataset", metavar="SCOPE:NAME",
                    help="Attach successful uploads to this dataset; created if it does not exist")
     p.add_argument("--no-top-dir", action="store_true",
@@ -585,6 +588,10 @@ def main() -> None:
     if args.name:
         # --name is only valid for a single file; guard above ensures this
         inputs = [(inputs[0][0], args.name)]
+
+    if args.name_prefix:
+        prefix = args.name_prefix.rstrip("/") + "/"
+        inputs = [(p, prefix + n) for p, n in inputs]
 
     if not inputs:
         log.error("No files found to upload")
