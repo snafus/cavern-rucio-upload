@@ -20,7 +20,6 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import logging
 import os
 import sys
@@ -177,22 +176,21 @@ def get_webdav_protocol(rse_name: str, rse_client: RSEClient) -> dict:
     )
 
 
-def build_pfn(scope: str, name: str, protocol: dict) -> str:
+def resolve_pfns(
+    rse_name: str,
+    scope: str,
+    names: list[str],
+    rse_client: RSEClient,
+) -> dict[str, str]:
     """
-    Construct a deterministic PFN for a Rucio file on a WebDAV RSE.
+    Resolve logical filenames to PFNs using Rucio's own lfns2pfns API.
 
-    Rucio deterministic path layout:
-      {scheme}://{hostname}:{port}{prefix}/{scope}/{md5[0:2]}/{md5[2:4]}/{name}
+    Returns a dict mapping 'scope:name' → PFN for each name in names.
+    Uses the RSE's configured lfn2pfn_algorithm, so custom path schemes
+    are handled correctly without any hand-rolled path construction.
     """
-    digest = hashlib.md5(f"{scope}:{name}".encode()).hexdigest()
-    prefix = protocol["prefix"].rstrip("/")
-    path = f"{prefix}/{scope}/{digest[0:2]}/{digest[2:4]}/{name}"
-
-    scheme = protocol["scheme"]
-    hostname = protocol["hostname"]
-    port = protocol.get("port", 443)
-
-    return f"{scheme}://{hostname}:{port}{path}"
+    lfns = [{"scope": scope, "name": name} for name in names]
+    return rse_client.lfns2pfns(rse=rse_name, lfns=lfns, operation="write")
 
 
 # ---------------------------------------------------------------------------
@@ -443,19 +441,18 @@ def upload_and_register(
     scope: str,
     name: str,
     rse_name: str,
-    protocol: dict,
+    pfn: str,
     token_provider: TokenProvider,
     replica_client: ReplicaClient,
     dry_run: bool = False,
 ) -> bool:
     """
-    Full pipeline for one file: metadata → PFN → PUT → register.
+    Full pipeline for one file: metadata → PUT → register.
+    PFN is pre-computed by the caller via resolve_pfns().
     Returns True only if both PUT and registration succeed.
     Registration is skipped (and returns False) if the PUT fails.
     """
     log.info("Processing %s → %s:%s", local_path, scope, name)
-
-    pfn = build_pfn(scope, name, protocol)
     log.debug("  pfn=%s", pfn)
 
     if dry_run:
@@ -560,12 +557,9 @@ def main() -> None:
     # Storage endpoint token provider
     token_provider = build_token_provider(args, rucio_client)
 
-    # Resolve RSE WebDAV protocol once
+    # Verify the RSE has a write-capable WebDAV protocol (needed for davs→https rewrite on PUT)
     try:
-        protocol = get_webdav_protocol(args.rse, rse_client)
-        log.debug("Using protocol: %s://%s:%s%s",
-                  protocol["scheme"], protocol["hostname"],
-                  protocol.get("port", 443), protocol["prefix"])
+        get_webdav_protocol(args.rse, rse_client)
     except ValueError as exc:
         log.error("%s", exc)
         sys.exit(1)
@@ -599,17 +593,31 @@ def main() -> None:
 
     log.info("Found %d file(s) to upload", len(inputs))
 
+    # Resolve all PFNs in one batch call before transferring anything
+    names = [name for _, name in inputs]
+    try:
+        pfn_map = resolve_pfns(args.rse, args.scope, names, rse_client)
+    except Exception as exc:
+        log.error("Failed to resolve PFNs from Rucio: %s", exc)
+        sys.exit(1)
+
     # Upload loop
     succeeded: list[dict] = []
     failed: list[Path] = []
 
     for path, logical_name in inputs:
+        pfn = pfn_map.get(f"{args.scope}:{logical_name}")
+        if not pfn:
+            log.error("No PFN returned for %s:%s — skipping", args.scope, logical_name)
+            failed.append(path)
+            continue
+
         ok = upload_and_register(
             local_path=path,
             scope=args.scope,
             name=logical_name,
             rse_name=args.rse,
-            protocol=protocol,
+            pfn=pfn,
             token_provider=token_provider,
             replica_client=replica_client,
             dry_run=args.dry_run,
